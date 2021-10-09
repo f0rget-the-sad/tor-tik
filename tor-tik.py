@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import sys
 import subprocess
@@ -49,20 +50,10 @@ def gen_ffmpeg_config_file(out_files, download_dir):
             f.writelines(ff_lines)
     return ff_config_full_path
 
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <input_list_file> <out_folder>")
-        exit(1)
-    # parse args
-    tt_list = sys.argv[1]
-    download_dir = sys.argv[2]
-    if not os.path.exists(download_dir):
-        print(f"Directory: {download_dir} do not exist")
-        exit(1)
 
-    print(logo)
-
-    tids = [url2id(url) for url in get_urls_from_list(tt_list)]
+def main(config):
+    tids = [url2id(url) for url in get_urls_from_list(config.input)]
+    download_dir = config.output
 
     print(f"Number of tic-toks: {len(tids)}")
     print("Downloading...")
@@ -84,3 +75,20 @@ if __name__ == "__main__":
     ffmpeg_file = gen_ffmpeg_config_file(out_files, download_dir)
     subprocess.check_output(["ffmpeg", "-f", "concat", "-i", ffmpeg_file,
         "-y", "-c", "copy", f"{download_dir}/out.mp4"])
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-i", "--input", required=True, dest="input",
+        help="Input list file of tic-toks", type=str)
+    parser.add_argument("-o", "--output", required=True, dest="output",
+        help="Output directory, where will stored all the results", type=str)
+    args = parser.parse_args()
+    if not os.path.exists(args.output):
+        os.mkdir(args.output)
+        print(f"Directory: {args.output} do not exist")
+    return args
+
+if __name__ == "__main__":
+    config = parse_args(sys.argv)
+    print(logo)
+    main(config)
