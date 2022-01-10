@@ -44,4 +44,8 @@ $ ./tor-tik.py -i tt_list_example.txt -o downloads
 - [x] Insert some short transition between them
 - [ ] Replace text smiles with rendered one(or render text + smiles and put on
   top of video)
-- [ ] Generate some sort of time codes(separate or bake into a video)
+- [ ] Generate some sort of time codes(separate or bake into a video) - to be
+  able to know what is the link of the tiktok currently playing
+- [ ] Copy from TikTok messages is fucking mess, if you just C-C it's in
+  reversed order, but multi-line comments are ok, they are passed in protobuf no
+  idea how to parse
