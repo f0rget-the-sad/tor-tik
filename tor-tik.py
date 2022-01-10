@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -9,6 +10,7 @@ from TikTokApi import TikTokApi
 api = TikTokApi.get_instance()
 
 FFMEG_CONFIG = "ffmeg_input.txt"
+OUT_BASE_NAME = "out"
 
 logo = """
  ______   ___   ____                  ______  ____  __  _ 
@@ -20,23 +22,65 @@ l_j  l_j|  O  ||    /     |     |    l_j  l_j |  | |    \
   l__j   \___/ l__j\_j                 l__j  |____jl__j\_j
 """
 
-def url2id(url):
-    return int(url.split("/video/")[1].split("?")[0])
+# def init_global_api()
 
-def fname_from_tid(download_dir, tid):
-    return os.path.join(download_dir, f"{tid}.mp4")
+class TikTok():
+    def __init__(self, url, tid, description):
+        self.url = url
+        self.tid = tid
+        self.description = description
+        self.api_info = api.get_tiktok_by_id(self.tid) # construct tic-tok dict
+        # NOTE: it's definitely possible to extract duration from file (like we
+        # do with transition file), but it cause subprocess call, which is
+        # slower the get it from already parsed tiktok data, so let's use this
+        self.duration = self.api_info['itemInfo']['itemStruct']['video']['duration']
 
-def download(tid, out_file):
-    tt = api.get_tiktok_by_id(tid) # construct tic-tok dict
-    data = api.get_video_by_tiktok(tt)
-    with open(out_file, 'wb') as output:
-        output.write(data) # saves data to the mp4 file
+    @classmethod
+    def from_url(cls, url):
+        return cls(url, TikTok.url2id(url), "")
 
-def get_urls_from_list(filename):
+    @staticmethod
+    def url2id(url):
+        return int(url.split("/video/")[1].split("?")[0])
+
+    @staticmethod
+    def fname_from_tid(download_dir, tid):
+        return os.path.join(download_dir, f"{tid}.mp4")
+
+    def download(self, download_dir):
+        out_file = TikTok.fname_from_tid(download_dir, self.tid)
+        # caching(sort of)
+        if os.path.exists(out_file):
+            return out_file
+        data = api.get_video_by_tiktok(self.api_info)
+        with open(out_file, 'wb') as output:
+            output.write(data) # saves data to the mp4 file
+        return out_file
+
+def parse_file(filename):
+    """
+    parse text file to inner structure in following way:
+    - any line that starts with `TIK_TOK_LINK_LINE` will be interpreted as link
+      to tiktok video
+    - all following non-empty lines will be interpreted as description and will
+      be put to subtitles file
+    """
+    TIK_TOK_LINK_LINE = "https://www.tiktok.com"
+    tt = None
     with open(filename) as f:
         for line in f.readlines():
-            if line.startswith("https://www.tiktok.com"):
-                yield line
+            if line.startswith(TIK_TOK_LINK_LINE):
+                # new tiktok found, yield exisiting
+                if tt is not None:
+                    yield tt
+                tt = TikTok.from_url(line)
+            elif line.strip():
+                if tt is None:
+                    continue
+                tt.description += line
+    if tt is not None:
+        yield tt
+
 
 def intersperse(lst, item):
     """
@@ -45,6 +89,7 @@ def intersperse(lst, item):
     result = [item] * (len(lst) * 2 - 1)
     result[0::2] = lst
     return result
+
 
 def gen_ffmpeg_config_file(out_files, out_dir):
     ff_lines = []
@@ -56,15 +101,23 @@ def gen_ffmpeg_config_file(out_files, out_dir):
             f.writelines(ff_lines)
     return ff_config_full_path
 
+def ffmpeg_format_info(inputfile):
+    output = subprocess.check_output(["ffprobe", "-v", "quiet", "-show_format",
+        "-print_format", "json", "-i", inputfile], text=True)
+    return json.loads(output)
+
 def ffmpeg_convert_to_mts(inputfile):
     outfile = inputfile.replace(".mp4", ".mts")
+    # XXX: think more about this scale, for now it will set the width of 720px
+    # and the height will be set based on the ratio of the original video
+    # subprocess.check_output(["ffmpeg", "-i", inputfile, "-vf", "scale=-1:720", "-y", "-q", "0",
     subprocess.check_output(["ffmpeg", "-i", inputfile, "-y", "-q", "0",
         outfile])
     return outfile
 
 def ffmpeg_concat(ffmpeg_config, out_dir):
     subprocess.check_output(["ffmpeg", "-f", "concat", "-i", ffmpeg_config,
-        "-y", "-c", "copy", f"{out_dir}/out.mts"])
+        "-y", "-c", "copy", f"{out_dir}/{OUT_BASE_NAME}.mp4"])
 
 def concat_all(files, out_dir, transition):
     # convert all to mts format to concatenate it later without any problems,
@@ -77,8 +130,56 @@ def concat_all(files, out_dir, transition):
     ffmpeg_config = gen_ffmpeg_config_file(out_files, out_dir)
     ffmpeg_concat(ffmpeg_config, out_dir)
 
+def seconds2france(seconds):
+    """
+    Convert float value of seconds to timecode format used is
+    hours:minutes:seconds,milliseconds with time units fixed to two zero-padded
+    digits and fractions fixed to three zero-padded digits (00:00:00,000). The
+    fractional separator used is the comma, since the program was written in
+    France.
+    """
+    hours, rem = divmod(seconds, 3600)
+    minutes, sec = divmod(rem, 60)
+    int_sec = int(sec)
+    return "{:0>2}:{:0>2}:{:0>2},{:0>3}".format(int(hours), int(minutes),
+            int_sec, int((sec - int_sec) * 1000))
+
+def generate_subs(tiktoks, out_dir, transition):
+    """
+    Generate subtitles file in srt format(https://en.wikipedia.org/wiki/SubRip)
+    """
+    subs_file = f"{out_dir}/{OUT_BASE_NAME}.srt"
+    transition_duration = 0.0
+    if transition is not None:
+        transition_info = ffmpeg_format_info(transition)
+        transition_duration = float(transition_info["format"]["duration"])
+
+    with open(subs_file, "w") as fd:
+        current_time = 0.0
+        for n, tt in enumerate(tiktoks, 1):
+            if not tt.description:
+                current_time += tt.duration + transition_duration
+                continue
+            # A numeric counter indicating the number or position of the
+            # subtitle
+            fd.write(f"{n}\n")
+            # The time that the subtitle should appear on the screen, followed
+            # by --> and the time it should disappear
+            start_time = seconds2france(current_time)
+            end_time = seconds2france(current_time + tt.duration)
+            fd.write(f"{start_time} --> {end_time}\n")
+            # Subtitle text itself on one or more lines
+            fd.write(f"{tt.description.strip()}\n")
+            # A blank line containing no text, indicating the end of this
+            # subtitle
+            fd.write("\n")
+
+            current_time += tt.duration + transition_duration
+
+
 def main(config):
-    tids = [url2id(url) for url in get_urls_from_list(config.input)]
+    # tiktoks = [TikTok.from_url(url) for url in get_urls_from_list(config.input)]
+    tiktoks = list(parse_file(config.input))
     download_dir = config.output
     transition = None
 
@@ -86,26 +187,23 @@ def main(config):
         transition = os.path.join(download_dir,
                 os.path.basename(config.transition))
         shutil.copyfile(config.transition, transition)
-        # subprocess.check_output(["cp", config.transition, download_dir])
 
-    print(f"Number of tic-toks: {len(tids)}")
+    print(f"Number of tik-toks: {len(tiktoks)}")
     print("Downloading...")
     out_files = []
-    for tid in tids:
-        # caching(sort of)
-        out_file = fname_from_tid(download_dir, tid)
-        out_files.append(out_file)
-        if os.path.exists(out_file):
-            continue
+    for tt in tiktoks:
         try:
-            download(tid, out_file)
-            print(f"{tid} done")
+            out_files.append(tt.download(download_dir))
+            print(f"{tt.tid} done")
         except:
             out_files.pop()
-            print(f"{tid} fail")
+            print(f"{tt.tid} fail")
 
     print("generating full video...")
     concat_all(out_files, download_dir, transition)
+    print("generating subs...")
+    generate_subs(tiktoks, download_dir, transition)
+    print("DONE!")
 
 def parse_args(argv):
     parser = argparse.ArgumentParser()

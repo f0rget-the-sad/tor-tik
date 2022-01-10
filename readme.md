@@ -42,4 +42,6 @@ $ ./tor-tik.py -i tt_list_example.txt -o downloads
 - [x] Download tt videos from list
 - [x] Merge them together
 - [x] Insert some short transition between them
+- [ ] Replace text smiles with rendered one(or render text + smiles and put on
+  top of video)
 - [ ] Generate some sort of time codes(separate or bake into a video)
