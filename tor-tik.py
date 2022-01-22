@@ -29,15 +29,13 @@ class TikTok():
         self.url = url
         self.tid = tid
         self.description = description
-        self.api_info = api.get_tiktok_by_id(self.tid) # construct tic-tok dict
-        # NOTE: it's definitely possible to extract duration from file (like we
-        # do with transition file), but it cause subprocess call, which is
-        # slower the get it from already parsed tiktok data, so let's use this
-        self.duration = self.api_info['itemInfo']['itemStruct']['video']['duration']
+        self.api_info = None
+        self.duration = 0
+        self.local_file = None
 
     @classmethod
     def from_url(cls, url):
-        return cls(url, TikTok.url2id(url), "")
+        return cls(url, None, "")
 
     @staticmethod
     def url2id(url):
@@ -48,13 +46,15 @@ class TikTok():
         return os.path.join(download_dir, f"{tid}.mp4")
 
     def download(self, download_dir):
+        self.tid = TikTok.url2id(self.url)
         out_file = TikTok.fname_from_tid(download_dir, self.tid)
         # caching(sort of)
-        if os.path.exists(out_file):
-            return out_file
-        data = api.get_video_by_tiktok(self.api_info)
-        with open(out_file, 'wb') as output:
-            output.write(data) # saves data to the mp4 file
+        if not os.path.exists(out_file):
+            self.api_info = api.get_tiktok_by_id(self.tid)
+            data = api.get_video_by_tiktok(self.api_info)
+            with open(out_file, 'wb') as output:
+                output.write(data) # saves data to the mp4 file
+
         return out_file
 
 def parse_file(filename):
@@ -68,7 +68,8 @@ def parse_file(filename):
     TIK_TOK_LINK_LINE = "https://www.tiktok.com"
     tt = None
     with open(filename) as f:
-        for line in f.readlines():
+        for n, line in enumerate(f.readlines()):
+            print(n)
             if line.startswith(TIK_TOK_LINK_LINE):
                 # new tiktok found, yield exisiting
                 if tt is not None:
@@ -108,25 +109,21 @@ def ffmpeg_format_info(inputfile):
 
 def ffmpeg_convert_to_mts(inputfile):
     outfile = inputfile.replace(".mp4", ".mts")
-    # XXX: think more about this scale, for now it will set the width of 720px
-    # and the height will be set based on the ratio of the original video
-    # subprocess.check_output(["ffmpeg", "-i", inputfile, "-vf", "scale=-1:720", "-y", "-q", "0",
-    subprocess.check_output(["ffmpeg", "-i", inputfile, "-y", "-q", "0",
-        outfile])
+    if not os.path.exists(outfile):
+        subprocess.check_output(["ffmpeg", "-i", inputfile, "-q", "0", outfile])
     return outfile
 
 def ffmpeg_concat(ffmpeg_config, out_dir):
     subprocess.check_output(["ffmpeg", "-f", "concat", "-i", ffmpeg_config,
-        "-y", "-c", "copy", f"{out_dir}/{OUT_BASE_NAME}.mp4"])
+        "-y", "-c", "copy", f"{out_dir}/{OUT_BASE_NAME}.mts"])
 
-def concat_all(files, out_dir, transition):
-    # convert all to mts format to concatenate it later without any problems,
-    # XXX: not sure this is the best way to do this:
-    # https://video.stackexchange.com/questions/15468/non-monotonous-dts-on-concat-ffmpeg
-    out_files = [ffmpeg_convert_to_mts(f) for f in files]
-    if transition is not None:
-        transition = ffmpeg_convert_to_mts(transition)
-        out_files = intersperse(out_files, transition)
+def ffmpeg_attach_subs(out_dir):
+    video = f"{out_dir}/{OUT_BASE_NAME}.mts"
+    subs  = f"{out_dir}/{OUT_BASE_NAME}.srt"
+    subprocess.check_output(["ffmpeg", "-i", video, "-vf", f"subtitles={subs}",
+        f"{out_dir}/{OUT_BASE_NAME}_with_subs.mts"])
+
+def concat_all(out_files, out_dir):
     ffmpeg_config = gen_ffmpeg_config_file(out_files, out_dir)
     ffmpeg_concat(ffmpeg_config, out_dir)
 
@@ -144,15 +141,11 @@ def seconds2france(seconds):
     return "{:0>2}:{:0>2}:{:0>2},{:0>3}".format(int(hours), int(minutes),
             int_sec, int((sec - int_sec) * 1000))
 
-def generate_subs(tiktoks, out_dir, transition):
+def generate_subs(tiktoks, out_dir, transition_duration):
     """
     Generate subtitles file in srt format(https://en.wikipedia.org/wiki/SubRip)
     """
     subs_file = f"{out_dir}/{OUT_BASE_NAME}.srt"
-    transition_duration = 0.0
-    if transition is not None:
-        transition_info = ffmpeg_format_info(transition)
-        transition_duration = float(transition_info["format"]["duration"])
 
     with open(subs_file, "w") as fd:
         current_time = 0.0
@@ -190,19 +183,38 @@ def main(config):
 
     print(f"Number of tik-toks: {len(tiktoks)}")
     print("Downloading...")
-    out_files = []
+    completed_tiktoks = []
+
     for tt in tiktoks:
         try:
-            out_files.append(tt.download(download_dir))
-            print(f"{tt.tid} done")
+            mp4 = tt.download(download_dir)
+            # convert all to mts format to concatenate it later without any problems,
+            # XXX: not sure this is the best way to do this:
+            # https://video.stackexchange.com/questions/15468/non-monotonous-dts-on-concat-ffmpeg
+            mts = ffmpeg_convert_to_mts(mp4)
+            tt.duration = float(ffmpeg_format_info(mts)["format"]["duration"])
+            print(f"{tt.tid}({tt.duration})done")
+            tt.local_file = mts
+            completed_tiktoks.append(tt)
         except:
-            out_files.pop()
             print(f"{tt.tid} fail")
 
+    out_files = [tt.local_file for tt in completed_tiktoks]
+
+    # insert transition between tt if exist
+    if transition is not None:
+        transition = ffmpeg_convert_to_mts(transition)
+        out_files = intersperse(out_files, transition)
+        transition_info = ffmpeg_format_info(transition)
+        transition_duration = float(transition_info["format"]["duration"])
+    else:
+        transition_duration = 0.0
+
     print("generating full video...")
-    concat_all(out_files, download_dir, transition)
+    concat_all(out_files, download_dir)
+
     print("generating subs...")
-    generate_subs(tiktoks, download_dir, transition)
+    generate_subs(completed_tiktoks, download_dir, transition_duration)
     print("DONE!")
 
 def parse_args(argv):
